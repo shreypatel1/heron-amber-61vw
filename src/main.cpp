@@ -30,29 +30,55 @@ static void tick(const char* what) { if (VERBOSE) fprintf(stderr, "%8.3f  %s\n",
 // ---------------------------------------------------------------- strings -> codes
 // Strings of 1..9 ASCII chars (1..127) pack into an order-preserving 63-bit code (code9).
 // Everything else is interned: code = FALLBACK | index.
+// Strings that don't fit code9 are interned. To avoid a single global lock
+// (12.7% of ~55M encode calls fall back here, which serialized all 8 parse
+// threads), the interner is sharded by hash: each shard has its own mutex and
+// string table. A fallback code packs the shard id and the per-shard index:
+//   code = FALLBACK | (shard << SHARD_IDX_BITS) | local_index
 static const u64 FALLBACK = 1ULL << 63;
-struct Interner {
+static const int NSHARD = 256;
+static const int SHARD_IDX_BITS = 24;              // up to 16M strings per shard
+static const u32 SHARD_IDX_MASK = (1u << SHARD_IDX_BITS) - 1;
+static inline u64 fnv1a(const char* p, size_t n) {
+  u64 h = 1469598103934665603ULL;
+  for (size_t i = 0; i < n; i++) { h ^= (u8)p[i]; h *= 1099511628211ULL; }
+  return h;
+}
+struct Shard {
   mutex mu;
   unordered_map<string, u32> map;
   vector<string> strs;
-  u64 get(const char* p, size_t n) {
-    lock_guard<mutex> g(mu);
-    auto it = map.find(string(p, n));
-    if (it != map.end()) return FALLBACK | it->second;
-    u32 id = (u32)strs.size();
-    strs.emplace_back(p, n);
-    map.emplace(strs.back(), id);
-    return FALLBACK | id;
+};
+struct Interner {
+  Shard sh[NSHARD];
+  u64 get(const char* p, size_t n, u64 hash) {
+    u32 s = (u32)(hash & (NSHARD - 1));
+    Shard& sd = sh[s];
+    lock_guard<mutex> g(sd.mu);
+    auto it = sd.map.find(string(p, n));
+    u32 idx;
+    if (it != sd.map.end()) idx = it->second;
+    else {
+      idx = (u32)sd.strs.size();
+      sd.strs.emplace_back(p, n);
+      sd.map.emplace(sd.strs.back(), idx);
+    }
+    return FALLBACK | ((u64)s << SHARD_IDX_BITS) | idx;
+  }
+  const string& at(u64 code) const {
+    u32 s = (u32)((code >> SHARD_IDX_BITS) & (NSHARD - 1));
+    u32 idx = (u32)(code & SHARD_IDX_MASK);
+    return sh[s].strs[idx];
   }
 } INTERN;
 static inline u64 encode(const char* p, size_t n) {
   bool fits;
   u64 c = code9(p, (u32)n, fits);
   if (__builtin_expect(fits, 1)) return c;
-  return INTERN.get(p, n);
+  return INTERN.get(p, n, fnv1a(p, n));
 }
 static string decode(u64 code) {
-  if (code & FALLBACK) { lock_guard<mutex> g(INTERN.mu); return INTERN.strs[(u32)code]; }
+  if (code & FALLBACK) return INTERN.at(code);
   string s;
   for (int i = 0; i < 8; i++) {
     char c = (char)((code >> (7 + 7 * (7 - i))) & 0x7f);
