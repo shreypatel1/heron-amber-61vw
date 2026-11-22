@@ -46,25 +46,55 @@ static inline u64 fnv1a(const char* p, size_t n) {
 }
 struct Shard {
   mutex mu;
-  unordered_map<string, u32> map;
+  // flat open-addressing table; slot stores idx+1 into strs (0 = empty)
+  vector<u32> tab;
+  vector<u32> tabhash;   // parallel: high bits of the key hash for fast reject
+  u32 tmask = 0;
+  u64 count = 0;
   vector<string> strs;
+  void init(size_t cap) {  // cap power of two
+    tab.assign(cap, 0); tabhash.assign(cap, 0); tmask = (u32)(cap - 1);
+    strs.reserve(cap / 2);
+  }
+  void grow() {
+    size_t ncap = (size_t)(tmask + 1) * 2;
+    vector<u32> nt(ncap, 0), nh(ncap, 0);
+    u32 nm = (u32)(ncap - 1);
+    for (size_t i = 0; i <= tmask; i++) {
+      u32 v = tab[i]; if (!v) continue;
+      u32 hh = tabhash[i];
+      u32 h = hh & nm;
+      while (nt[h]) h = (h + 1) & nm;
+      nt[h] = v; nh[h] = hh;
+    }
+    tab.swap(nt); tabhash.swap(nh); tmask = nm;
+  }
 };
 struct Interner {
   Shard sh[NSHARD];
-  Interner() { for (int i = 0; i < NSHARD; i++) sh[i].map.reserve(8192); }
+  Interner() { for (int i = 0; i < NSHARD; i++) sh[i].init(16384); }
   u64 get(const char* p, size_t n, u64 hash) {
     u32 s = (u32)(hash & (NSHARD - 1));
     Shard& sd = sh[s];
+    u32 hh = (u32)(hash >> 32) | 1u;   // nonzero hash signature
     lock_guard<mutex> g(sd.mu);
-    auto it = sd.map.find(string(p, n));
-    u32 idx;
-    if (it != sd.map.end()) idx = it->second;
-    else {
-      idx = (u32)sd.strs.size();
-      sd.strs.emplace_back(p, n);
-      sd.map.emplace(sd.strs.back(), idx);
+    if ((sd.count + 1) * 4 >= (u64)(sd.tmask + 1) * 3) sd.grow();
+    u32 h = hh & sd.tmask;
+    for (;;) {
+      u32 v = sd.tab[h];
+      if (!v) {
+        u32 idx = (u32)sd.strs.size();
+        sd.strs.emplace_back(p, n);
+        sd.tab[h] = idx + 1; sd.tabhash[h] = hh; sd.count++;
+        return FALLBACK | ((u64)s << SHARD_IDX_BITS) | idx;
+      }
+      if (sd.tabhash[h] == hh) {
+        const string& e = sd.strs[v - 1];
+        if (e.size() == n && memcmp(e.data(), p, n) == 0)
+          return FALLBACK | ((u64)s << SHARD_IDX_BITS) | (v - 1);
+      }
+      h = (h + 1) & sd.tmask;
     }
-    return FALLBACK | ((u64)s << SHARD_IDX_BITS) | idx;
   }
   const string& at(u64 code) const {
     u32 s = (u32)((code >> SHARD_IDX_BITS) & (NSHARD - 1));
