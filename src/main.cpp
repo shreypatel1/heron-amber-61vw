@@ -151,8 +151,10 @@ static File map_file(const string& path) {
     // reserve zeroed slack after the file so SIMD loads may run past EOF
     size_t pg = 4096, len = (f.n + pg - 1) / pg * pg + 2 * pg;
     void* r = mmap(nullptr, len, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    void* m = mmap(r, f.n, PROT_READ, MAP_PRIVATE | MAP_FIXED | MAP_POPULATE, fd, 0);
+    void* m = mmap(r, f.n, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
     if (m == MAP_FAILED || r == MAP_FAILED) { perror("mmap"); exit(2); }
+    madvise(m, f.n, MADV_SEQUENTIAL);
+    madvise(m, f.n, MADV_HUGEPAGE);
     f.p = (const char*)m;
   }
   close(fd);
