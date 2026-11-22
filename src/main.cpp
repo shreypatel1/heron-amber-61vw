@@ -36,7 +36,7 @@ static void tick(const char* what) { if (VERBOSE) fprintf(stderr, "%8.3f  %s\n",
 // string table. A fallback code packs the shard id and the per-shard index:
 //   code = FALLBACK | (shard << SHARD_IDX_BITS) | local_index
 static const u64 FALLBACK = 1ULL << 63;
-static const int NSHARD = 256;
+static const int NSHARD = 1024;
 static const int SHARD_IDX_BITS = 24;              // up to 16M strings per shard
 static const u32 SHARD_IDX_MASK = (1u << SHARD_IDX_BITS) - 1;
 static inline u64 fnv1a(const char* p, size_t n) {
@@ -51,6 +51,7 @@ struct Shard {
 };
 struct Interner {
   Shard sh[NSHARD];
+  Interner() { for (int i = 0; i < NSHARD; i++) sh[i].map.reserve(8192); }
   u64 get(const char* p, size_t n, u64 hash) {
     u32 s = (u32)(hash & (NSHARD - 1));
     Shard& sd = sh[s];
