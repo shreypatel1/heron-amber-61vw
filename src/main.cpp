@@ -817,5 +817,6 @@ int main() {
     for (auto& x : th) x.join();
   }
   tick("written");
-  return 0;
+  fflush(stderr);
+  _exit(0);
 }
